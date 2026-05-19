@@ -1,0 +1,12 @@
+[package]
+name = "cw-serial-keyer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Async Rust library for keying Morse/CW on serial port control lines"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serialport = "4"
+thiserror = "1"
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
