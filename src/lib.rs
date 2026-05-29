@@ -24,6 +24,7 @@ pub use tcp_proxy::SerialTcpServer;
 
 use serialport::SerialPort;
 use thiserror::Error;
+use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::broadcast;
 use tokio::sync::oneshot;
 use tokio::time::{sleep, timeout};
@@ -32,6 +33,7 @@ const DEFAULT_WPM: u8 = 24;
 const DEFAULT_WEIGHTING: u8 = 50;
 const DEFAULT_POLL_DELAY: Duration = Duration::from_millis(20);
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(500);
+const SERIAL_STREAM_BUFFER_SIZE: usize = 4096;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -255,6 +257,15 @@ impl SerialKeyer {
         }
     }
 
+    /// Create a Tokio byte stream backed by the same serial port used for keying.
+    ///
+    /// Bytes written to the returned stream are written to the serial port through
+    /// the keyer worker. Bytes read by the keyer worker are readable from the
+    /// stream. Dropping the stream stops the bridge task.
+    pub fn serial_stream(&self) -> DuplexStream {
+        serial_stream_from_channel(self.serial_channel())
+    }
+
     /// Write raw bytes to the serial port through the keyer worker.
     pub async fn write_serial(&self, bytes: impl AsRef<[u8]>) -> Result<()> {
         write_serial_command(&self.tx, bytes.as_ref().to_vec()).await
@@ -309,6 +320,40 @@ impl Drop for SerialKeyer {
     }
 }
 
+fn serial_stream_from_channel(mut channel: SerialChannel) -> DuplexStream {
+    let (stream, mut bridge_stream) = duplex(SERIAL_STREAM_BUFFER_SIZE);
+
+    tokio::spawn(async move {
+        let mut stream_buf = [0_u8; SERIAL_STREAM_BUFFER_SIZE];
+
+        loop {
+            tokio::select! {
+                read = bridge_stream.read(&mut stream_buf) => {
+                    let Ok(read) = read else {
+                        break;
+                    };
+                    if read == 0 {
+                        break;
+                    }
+                    if channel.write(&stream_buf[..read]).await.is_err() {
+                        break;
+                    }
+                }
+                serial = channel.read() => {
+                    let Ok(bytes) = serial else {
+                        break;
+                    };
+                    if bridge_stream.write_all(&bytes).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    stream
+}
+
 pub(crate) async fn write_serial_command(tx: &mpsc::Sender<Command>, bytes: Vec<u8>) -> Result<()> {
     let (ack_tx, ack_rx) = oneshot::channel();
     tx.send(Command {
@@ -359,6 +404,8 @@ fn worker_main(
 ) {
     let mut port = match serialport::new(config.path.to_string_lossy(), config.baud_rate)
         .timeout(Duration::from_millis(100))
+        .dtr_on_open(false)
+        .flow_control(serialport::FlowControl::None)
         .open()
     {
         Ok(port) => port,
@@ -701,6 +748,22 @@ fn validate_config(config: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn test_serial_channel() -> (
+        SerialChannel,
+        mpsc::Receiver<Command>,
+        broadcast::Sender<Vec<u8>>,
+    ) {
+        let (tx, rx) = mpsc::channel();
+        let (read_tx, _) = broadcast::channel(16);
+        let channel = SerialChannel {
+            tx,
+            read_tx: read_tx.clone(),
+            rx: read_tx.subscribe(),
+        };
+        (channel, rx, read_tx)
+    }
 
     #[test]
     fn maps_common_morse() {
@@ -725,5 +788,57 @@ mod tests {
             validate_config(&cfg),
             Err(Error::ConflictingLines)
         ));
+    }
+
+    #[tokio::test]
+    async fn serial_stream_writes_to_serial_channel() {
+        let (channel, rx, _) = test_serial_channel();
+        let mut stream = serial_stream_from_channel(channel);
+        let write = tokio::spawn(async move { stream.write_all(b"FA;").await });
+
+        let command = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match rx.try_recv() {
+                    Ok(command) => return command,
+                    Err(mpsc::TryRecvError::Empty) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        panic!("write command channel disconnected");
+                    }
+                }
+            }
+        })
+        .await
+        .expect("write command is sent");
+        match command.kind {
+            CommandKind::WriteSerial(bytes) => assert_eq!(bytes, b"FA;"),
+            _ => panic!("expected write serial command"),
+        }
+        command
+            .ack
+            .expect("write command has ack")
+            .send(Ok(()))
+            .expect("ack is received");
+
+        write
+            .await
+            .expect("write task joins")
+            .expect("stream write succeeds");
+    }
+
+    #[tokio::test]
+    async fn serial_stream_reads_from_serial_channel() {
+        let (channel, _rx, read_tx) = test_serial_channel();
+        let mut stream = serial_stream_from_channel(channel);
+        read_tx.send(b"IF;".to_vec()).expect("serial data is sent");
+
+        let mut buf = [0_u8; 3];
+        tokio::time::timeout(Duration::from_secs(1), stream.read_exact(&mut buf))
+            .await
+            .expect("stream read completes")
+            .expect("stream read succeeds");
+
+        assert_eq!(&buf, b"IF;");
     }
 }
